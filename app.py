@@ -2,8 +2,9 @@ import os
 import tempfile
 import base64
 import io
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -20,6 +21,58 @@ VECTORENGINE_API_KEY = os.getenv("VECTORENGINE_API_KEY")
 
 DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
 os.makedirs(DOCS_DIR, exist_ok=True)
+
+
+def get_files_from_folder(folder_path: str, include_subfolders: bool = True) -> List[Path]:
+    """递归获取文件夹中的所有文件
+    
+    Args:
+        folder_path: 文件夹路径
+        include_subfolders: 是否包含子文件夹
+        
+    Returns:
+        文件路径列表
+    """
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        return []
+    
+    supported_extensions = {'.txt', '.md', '.doc', '.docx', '.xlsx', '.pdf', '.jpg', '.jpeg', '.png', '.bmp'}
+    files = []
+    
+    if include_subfolders:
+        for file_path in folder.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in supported_extensions:
+                files.append(file_path)
+    else:
+        for file_path in folder.glob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in supported_extensions:
+                files.append(file_path)
+    
+    return sorted(files)
+
+
+def create_file_object(file_path: Path):
+    """创建类似UploadedFile的对象
+    
+    Args:
+        file_path: 文件路径
+        
+    Returns:
+        包含文件信息的对象
+    """
+    class FileObject:
+        def __init__(self, path: Path):
+            self.name = path.name
+            self.path = str(path)
+            self.size = path.stat().st_size
+            self._path = path
+        
+        def read(self):
+            with open(self._path, 'rb') as f:
+                return f.read()
+    
+    return FileObject(file_path)
 
 
 @st.cache_data(ttl=300)
@@ -102,7 +155,7 @@ def split_text(text: str, max_chars: int = 1000, overlap: int = 200) -> List[str
     return chunks
 
 
-def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://localhost:11434", model_name: str = "my-PaddleOCR-VL:0.9b", filename: str = "document.pdf") -> str:
+def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://localhost:11434", model_name: str = "my-glm-ocr:latest", filename: str = "document.pdf") -> str:
     """使用Ollama的OCR模型将PDF转换为Markdown
     
     支持的模型:
@@ -242,6 +295,49 @@ def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://loca
         return ""
 
 
+def convert_doc_to_docx_bytes(doc_bytes: bytes) -> bytes:
+    """使用Windows上的Word将doc转换为docx
+    
+    Args:
+        doc_bytes: .doc文件的字节数据
+        
+    Returns:
+        .docx文件的字节数据
+    """
+    import win32com.client as win32
+    import pythoncom
+    
+    # 必须初始化COM，否则Streamlit多线程环境下会报错
+    pythoncom.CoInitialize()
+    
+    # 将上传的字节流写入临时.doc文件
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".doc") as temp_doc:
+        temp_doc.write(doc_bytes)
+        temp_doc_path = temp_doc.name
+        
+    temp_docx_path = temp_doc_path + "x"  # 目标路径.docx
+    
+    try:
+        word = win32.Dispatch("Word.Application")
+        word.Visible = False
+        # 打开.doc并另存为.docx (FileFormat=16表示docx格式)
+        doc = word.Documents.Open(temp_doc_path)
+        doc.SaveAs(temp_docx_path, FileFormat=16)
+        doc.Close()
+        word.Quit()
+        
+        # 读取生成的docx字节流
+        with open(temp_docx_path, "rb") as f:
+            docx_bytes = f.read()
+        return docx_bytes
+    finally:
+        # 清理临时文件
+        if os.path.exists(temp_doc_path):
+            os.remove(temp_doc_path)
+        if os.path.exists(temp_docx_path):
+            os.remove(temp_docx_path)
+
+
 def extract_text_from_docx(file_bytes: bytes) -> str:
     """从DOCX文件中提取文本"""
     try:
@@ -287,13 +383,143 @@ def batched(iterable, batch_size: int):
         yield batch
 
 
-def extract_text_from_file(uploaded_file, ollama_url: str = "http://localhost:11434", ocr_model: str = "my-PaddleOCR-VL:0.9b") -> str:
+def extract_text_from_image(image_bytes: bytes, ollama_url: str = "http://localhost:11434", model_name: str = "my-glm-ocr:latest", filename: str = "image.jpg") -> str:
+    """使用Ollama的OCR模型从图像中提取文本
+    
+    Args:
+        image_bytes: 图像文件的字节数据
+        ollama_url: Ollama服务地址
+        model_name: 使用的OCR模型名称
+        filename: 原始文件名，用于保存Markdown文件
+        
+    Returns:
+        识别出的文本内容
+    """
+    try:
+        st.info(f"正在识别图像: {filename}")
+        
+        # 将图像转换为base64
+        img_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # 根据模型选择不同的调用方式
+        if model_name == "my-PaddleOCR-VL:0.9b":
+            # PaddleOCR-VL-1.5 使用chat API
+            response = requests.post(
+                f"{ollama_url}/api/chat",
+                json={
+                    "model": "my-PaddleOCR-VL:0.9b",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "请识别这张图片中的文字内容，并以Markdown格式输出。保留原有的段落结构和格式。",
+                            "images": [img_base64]
+                        }
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 4096
+                    }
+                },
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("message", {}).get("content", "")
+                if not content:
+                    content = result.get("response", "")
+                
+                if content:
+                    # 自动保存Markdown文件到docs文件夹
+                    try:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        base_name = os.path.splitext(filename)[0]
+                        md_filename = f"{base_name}_{timestamp}.md"
+                        md_filepath = os.path.join(DOCS_DIR, md_filename)
+                        
+                        with open(md_filepath, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        
+                        st.success(f"✅ 图像识别完成，Markdown文件已保存: {md_filename}")
+                    except Exception as save_error:
+                        st.warning(f"⚠️ 保存Markdown文件失败: {str(save_error)}")
+                    
+                    return content
+                else:
+                    st.warning("未能识别出任何内容")
+                    return ""
+            else:
+                st.error(f"❌ 图像识别失败: {response.status_code}")
+                return ""
+        else:
+            # GLM-OCR 使用Ollama原生 /api/generate 端点
+            response = requests.post(
+                f"{ollama_url}/api/generate",
+                json={
+                    "model": "my-glm-ocr:latest",
+                    "prompt": "Text Recognition:",
+                    "images": [img_base64],
+                    "stream": False
+                },
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("response", "")
+                if not content:
+                    content = result.get("message", {}).get("content", "")
+                
+                if content:
+                    # 自动保存Markdown文件到docs文件夹
+                    try:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        base_name = os.path.splitext(filename)[0]
+                        md_filename = f"{base_name}_{timestamp}.md"
+                        md_filepath = os.path.join(DOCS_DIR, md_filename)
+                        
+                        with open(md_filepath, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        
+                        st.success(f"✅ 图像识别完成，Markdown文件已保存: {md_filename}")
+                    except Exception as save_error:
+                        st.warning(f"⚠️ 保存Markdown文件失败: {str(save_error)}")
+                    
+                    return content
+                else:
+                    st.warning("未能识别出任何内容")
+                    return ""
+            else:
+                st.error(f"❌ 图像识别失败: {response.status_code}")
+                return ""
+                
+    except Exception as e:
+        st.error(f"图像识别失败: {str(e)}")
+        import traceback
+        st.error(f"详细错误: {traceback.format_exc()}")
+        return ""
+
+
+def extract_text_from_file(uploaded_file, ollama_url: str = "http://localhost:11434", ocr_model: str = "my-glm-ocr:latest") -> str:
     """根据文件类型提取文本内容"""
     file_name = uploaded_file.name.lower()
     file_bytes = uploaded_file.read()
     
     if file_name.endswith('.txt') or file_name.endswith('.md'):
         return file_bytes.decode('utf-8')
+    
+    elif file_name.endswith('.doc'):
+        # .doc文件先转换为.docx再提取文本
+        st.info(f"正在将旧版Word文件 {uploaded_file.name} 转换为新版格式...")
+        try:
+            # 将doc转为docx的字节流
+            docx_bytes = convert_doc_to_docx_bytes(file_bytes)
+            # 复用原有的docx文本提取逻辑
+            return extract_text_from_docx(docx_bytes)
+        except Exception as e:
+            st.error(f"DOC转换失败 (请确保系统已安装Microsoft Word): {str(e)}")
+            return ""
     
     elif file_name.endswith('.docx'):
         return extract_text_from_docx(file_bytes)
@@ -306,12 +532,17 @@ def extract_text_from_file(uploaded_file, ollama_url: str = "http://localhost:11
         st.info(f"正在使用 {ocr_model} 处理PDF文件: {uploaded_file.name}")
         return pdf_to_markdown_with_ollama(file_bytes, ollama_url, ocr_model, uploaded_file.name)
     
+    elif file_name.endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+        # 图像文件使用Ollama OCR识别
+        st.info(f"正在使用 {ocr_model} 处理图像文件: {uploaded_file.name}")
+        return extract_text_from_image(file_bytes, ollama_url, ocr_model, uploaded_file.name)
+    
     else:
         st.warning(f"不支持的文件格式: {uploaded_file.name}")
         return ""
 
 
-def process_uploaded_files(uploaded_files, index_name: str, namespace: str) -> Tuple[int, int]:
+def process_uploaded_files(uploaded_files, index_name: str, namespace: str, ollama_url: str = "http://localhost:11434", ocr_model: str = "my-glm-ocr:latest") -> Tuple[int, int]:
     index = get_pinecone_index(index_name)
     if not index:
         return 0, 0
@@ -383,7 +614,7 @@ def pdf_to_markdown_page():
     ocr_model = st.sidebar.selectbox(
         "选择OCR模型",
         options=["my-PaddleOCR-VL:0.9b", "my-glm-ocr:latest"],
-        index=0,
+        index=1,
         help="选择用于PDF识别的OCR模型"
     )
 
@@ -470,7 +701,7 @@ def document_upload_page():
     ocr_model = st.sidebar.selectbox(
         "PDF识别模型",
         options=["my-PaddleOCR-VL:0.9b", "my-glm-ocr:latest"],
-        index=0,
+        index=1,
         help="选择用于PDF识别的OCR模型"
     )
 
@@ -629,12 +860,52 @@ def document_upload_page():
     st.markdown("---")
     st.subheader("上传文档")
 
-    uploaded_files = st.file_uploader(
-        "选择文件 (支持: txt, md, docx, xlsx, pdf)",
-        type=["txt", "md", "docx", "xlsx", "pdf"],
-        accept_multiple_files=True,
-        help="上传文本、Markdown、Word、Excel或PDF文件到Pinecone"
+    st.info("📌 支持两种上传方式：选择单个文件或选择文件夹进行批量上传")
+
+    upload_mode = st.radio(
+        "选择上传方式",
+        ["📁 选择文件", "📂 选择文件夹"],
+        horizontal=True,
+        label_visibility="collapsed"
     )
+
+    if upload_mode == "📁 选择文件":
+        uploaded_files = st.file_uploader(
+            "选择文件 (支持: txt, md, doc, docx, xlsx, pdf, jpg, jpeg, png, bmp)",
+            type=["txt", "md", "doc", "docx", "xlsx", "pdf", "jpg", "jpeg", "png", "bmp"],
+            accept_multiple_files=True,
+            help="上传文本、Markdown、Word、Excel、PDF或图像文件到Pinecone"
+        )
+        folder_mode = False
+    else:
+        folder_path = st.text_input(
+            "文件夹路径",
+            placeholder="例如: D:\\Documents\\MyFiles",
+            help="输入要批量上传的文件夹路径"
+        )
+        
+        include_subfolders = st.checkbox(
+            "包含子文件夹",
+            value=True,
+            help="是否递归处理子文件夹中的文件"
+        )
+        
+        folder_files = []
+        if folder_path:
+            folder_files = get_files_from_folder(folder_path, include_subfolders)
+            
+            if folder_files:
+                st.success(f"✅ 找到 {len(folder_files)} 个文件")
+                
+                with st.expander("📋 查看文件列表", expanded=False):
+                    for i, file_path in enumerate(folder_files, 1):
+                        rel_path = file_path.relative_to(folder_path) if folder_path else file_path
+                        st.text(f"{i}. {rel_path} ({file_path.stat().st_size / 1024:.1f} KB)")
+            else:
+                st.warning("⚠️ 未找到支持的文件或文件夹路径无效")
+        
+        uploaded_files = folder_files
+        folder_mode = True
 
     col1, col2 = st.columns([1, 1])
 
@@ -653,26 +924,52 @@ def document_upload_page():
             "重叠字符数",
             min_value=0,
             max_value=1000,
-            value=200,
+            value=100,
             step=50,
             help="文本块之间的重叠字符数"
         )
 
     if st.button("🚀 上传文档", type="primary", use_container_width=True):
         if not uploaded_files:
-            st.warning("请至少上传一个文件!")
+            st.warning("请至少上传一个文件或选择一个文件夹!")
             return
 
         with st.spinner("正在处理文档...这可能需要一些时间。"):
             try:
-                total_docs, total_vectors = process_uploaded_files(uploaded_files, selected_index, selected_namespace)
+                if folder_mode:
+                    progress_bar = st.progress(0, text="准备上传...")
+                    total_docs = 0
+                    total_vectors = 0
+                    
+                    for idx, file_path in enumerate(uploaded_files):
+                        progress_bar.progress((idx + 1) / len(uploaded_files), text=f"正在处理 ({idx + 1}/{len(uploaded_files)}): {file_path.name}")
+                        
+                        try:
+                            file_obj = create_file_object(file_path)
+                            docs, vectors = process_uploaded_files([file_obj], selected_index, selected_namespace, ollama_url, ocr_model)
+                            total_docs += docs
+                            total_vectors += vectors
+                        except Exception as e:
+                            st.error(f"处理文件 {file_path.name} 时出错: {str(e)}")
+                            continue
+                    
+                    progress_bar.empty()
+                    
+                    if selected_namespace != "default" and selected_namespace not in st.session_state.created_namespaces[selected_index]:
+                        st.session_state.created_namespaces[selected_index].append(selected_namespace)
+                    
+                    st.success(f"✅ 上传完成!")
+                    st.metric("已处理文档", total_docs)
+                    st.metric("已创建向量", total_vectors)
+                else:
+                    total_docs, total_vectors = process_uploaded_files(uploaded_files, selected_index, selected_namespace, ollama_url, ocr_model)
 
-                if selected_namespace != "default" and selected_namespace not in st.session_state.created_namespaces[selected_index]:
-                    st.session_state.created_namespaces[selected_index].append(selected_namespace)
+                    if selected_namespace != "default" and selected_namespace not in st.session_state.created_namespaces[selected_index]:
+                        st.session_state.created_namespaces[selected_index].append(selected_namespace)
 
-                st.success(f"✅ 上传完成!")
-                st.metric("已处理文档", total_docs)
-                st.metric("已创建向量", total_vectors)
+                    st.success(f"✅ 上传完成!")
+                    st.metric("已处理文档", total_docs)
+                    st.metric("已创建向量", total_vectors)
 
             except Exception as e:
                 st.error(f"❌ 上传过程中出错: {str(e)}")
