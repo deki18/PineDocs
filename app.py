@@ -3,6 +3,7 @@ import tempfile
 import base64
 import io
 from typing import List, Tuple
+from datetime import datetime
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -16,6 +17,9 @@ load_dotenv()
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 VECTORENGINE_API_KEY = os.getenv("VECTORENGINE_API_KEY")
+
+DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
+os.makedirs(DOCS_DIR, exist_ok=True)
 
 
 @st.cache_data(ttl=300)
@@ -98,12 +102,18 @@ def split_text(text: str, max_chars: int = 1000, overlap: int = 200) -> List[str
     return chunks
 
 
-def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://localhost:11434", model_name: str = "my-PaddleOCR-VL:0.9b") -> str:
+def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://localhost:11434", model_name: str = "my-PaddleOCR-VL:0.9b", filename: str = "document.pdf") -> str:
     """使用Ollama的OCR模型将PDF转换为Markdown
     
     支持的模型:
     - my-PaddleOCR-VL:0.9b: PaddleOCR-VL-1.5 (推荐，效果更好)
     - my-glm-ocr:latest: GLM-OCR模型
+    
+    Args:
+        pdf_bytes: PDF文件的字节数据
+        ollama_url: Ollama服务地址
+        model_name: 使用的OCR模型名称
+        filename: 原始文件名，用于保存Markdown文件
     """
     try:
         # 使用PyMuPDF将PDF转换为图片列表
@@ -204,7 +214,23 @@ def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://loca
                     st.error(f"❌ 第 {page_num}/{len(images)} 页识别失败: {response.status_code}")
         
         if all_content:
-            return "\n\n---\n\n".join(all_content)
+            markdown_content = "\n\n---\n\n".join(all_content)
+            
+            # 自动保存Markdown文件到docs文件夹
+            try:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_name = os.path.splitext(filename)[0]
+                md_filename = f"{base_name}_{timestamp}.md"
+                md_filepath = os.path.join(DOCS_DIR, md_filename)
+                
+                with open(md_filepath, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
+                
+                st.success(f"✅ Markdown文件已自动保存到: {md_filename}")
+            except Exception as save_error:
+                st.warning(f"⚠️ 保存Markdown文件失败: {str(save_error)}")
+            
+            return markdown_content
         else:
             st.warning("未能识别出任何内容")
             return ""
@@ -278,7 +304,7 @@ def extract_text_from_file(uploaded_file, ollama_url: str = "http://localhost:11
     elif file_name.endswith('.pdf'):
         # PDF使用Ollama OCR转换为Markdown
         st.info(f"正在使用 {ocr_model} 处理PDF文件: {uploaded_file.name}")
-        return pdf_to_markdown_with_ollama(file_bytes, ollama_url, ocr_model)
+        return pdf_to_markdown_with_ollama(file_bytes, ollama_url, ocr_model, uploaded_file.name)
     
     else:
         st.warning(f"不支持的文件格式: {uploaded_file.name}")
@@ -392,7 +418,7 @@ def pdf_to_markdown_page():
             with st.spinner(f"正在使用 {ocr_model} 模型转换PDF，请稍候..."):
                 try:
                     pdf_bytes = uploaded_pdf.read()
-                    markdown_content = pdf_to_markdown_with_ollama(pdf_bytes, ollama_url, ocr_model)
+                    markdown_content = pdf_to_markdown_with_ollama(pdf_bytes, ollama_url, ocr_model, uploaded_pdf.name)
                     
                     if markdown_content:
                         st.success("✅ 转换成功!")
