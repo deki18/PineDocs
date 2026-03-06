@@ -211,7 +211,7 @@ def ocr_image(image_bytes: bytes, ollama_url: str, model_name: str) -> Tuple[str
 
 
 def pdf_to_text(pdf_bytes: bytes, ollama_url: str, model_name: str, filename: str) -> Tuple[str, str]:
-    """将PDF转换为文本"""
+    """将PDF转换为文本，如果没有文本层则使用OCR"""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         all_text = []
@@ -223,9 +223,90 @@ def pdf_to_text(pdf_bytes: bytes, ollama_url: str, model_name: str, filename: st
                 all_text.append(f"--- 第 {page_num + 1} 页 ---\n{text}")
         
         doc.close()
+        
+        # 如果没有提取到文本，可能是扫描版PDF，使用OCR
+        if not all_text:
+            print(f"PDF没有文本层，尝试使用OCR识别: {filename}")
+            return pdf_to_text_with_ocr(pdf_bytes, ollama_url, model_name, filename)
+        
         return "\n\n".join(all_text), None
     except Exception as e:
         return "", f"PDF处理失败: {str(e)}"
+
+
+def pdf_to_text_with_ocr(pdf_bytes: bytes, ollama_url: str, model_name: str, filename: str = "") -> Tuple[str, str]:
+    """使用OCR识别PDF中的文字（用于扫描版PDF）"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        all_content = []
+        
+        print(f"开始OCR识别: {filename}，共 {total_pages} 页")
+        
+        # 保持高分辨率以获得更好的OCR效果
+        zoom = 2.0
+        mat = fitz.Matrix(zoom, zoom)
+        
+        for page_num in range(total_pages):
+            print(f"  处理第 {page_num + 1}/{total_pages} 页...")
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            
+            # 对图片进行OCR识别
+            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            # 根据模型选择不同的调用方式
+            if model_name == "my-PaddleOCR-VL:0.9b":
+                response = requests.post(
+                    f"{ollama_url}/api/chat",
+                    json={
+                        "model": "my-PaddleOCR-VL:0.9b",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "请识别这张图片中的文字内容。",
+                                "images": [img_base64]
+                            }
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": 4096}
+                    },
+                    timeout=300
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result.get("message", {}).get("content", "")
+                    if content:
+                        all_content.append(f"--- 第 {page_num + 1} 页 ---\n{content}")
+            else:
+                response = requests.post(
+                    f"{ollama_url}/api/generate",
+                    json={
+                        "model": "my-glm-ocr:latest",
+                        "prompt": "Text Recognition:",
+                        "images": [img_base64],
+                        "stream": False
+                    },
+                    timeout=300
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result.get("response", "")
+                    if content:
+                        all_content.append(f"--- 第 {page_num + 1} 页 ---\n{content}")
+        
+        doc.close()
+        
+        if all_content:
+            return "\n\n".join(all_content), None
+        else:
+            return "", "OCR识别失败，未能提取到任何文字"
+            
+    except Exception as e:
+        return "", f"OCR识别失败: {str(e)}"
 
 
 def extract_word_text(file_bytes: bytes, ext: str) -> Tuple[str, str]:
@@ -444,17 +525,27 @@ def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://loca
 
 # ============ Gradio 界面函数 ============
 
-def get_index_list():
-    """获取索引列表"""
+def get_index_list(max_retries=3):
+    """获取索引列表，带重试机制"""
     if not PINECONE_API_KEY:
         return [], "未配置PINECONE_API_KEY"
     
-    try:
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        indexes = [idx["name"] for idx in pc.list_indexes()]
-        return indexes, None
-    except Exception as e:
-        return [], f"获取索引列表失败: {str(e)}"
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            start_time = time.time()
+            pc = Pinecone(api_key=PINECONE_API_KEY)
+            indexes = [idx["name"] for idx in pc.list_indexes()]
+            elapsed = time.time() - start_time
+            print(f"获取索引列表成功，耗时: {elapsed:.2f}秒，索引数: {len(indexes)}")
+            return indexes, None
+        except Exception as e:
+            print(f"获取索引列表失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # 等待2秒后重试
+            else:
+                return [], f"获取索引列表失败: {str(e)}"
 
 
 def get_namespace_list(index_name: str):
@@ -463,6 +554,9 @@ def get_namespace_list(index_name: str):
         return ["default"]
     
     try:
+        import time
+        start_time = time.time()
+        
         index, error = get_pinecone_index(index_name)
         if error:
             print(f"获取索引失败: {error}")
@@ -471,48 +565,28 @@ def get_namespace_list(index_name: str):
         stats = index.describe_index_stats()
         namespaces = []
         
-        # 调试信息
-        print(f"Index stats type: {type(stats)}")
-        print(f"Index stats: {stats}")
-        
-        # 尝试不同的方式获取命名空间
+        # 获取命名空间数据
         ns_data = None
         if stats:
-            # 方式1: 直接访问 namespaces 属性
             if hasattr(stats, 'namespaces'):
                 ns_data = stats.namespaces
-                print(f"方式1 - stats.namespaces: {ns_data}")
-            # 方式2: 转换为字典
             elif hasattr(stats, '__dict__'):
-                stats_dict = stats.__dict__
-                print(f"方式2 - stats.__dict__: {stats_dict}")
-                ns_data = stats_dict.get('namespaces')
-            # 方式3: 如果是字典类型
+                ns_data = stats.__dict__.get('namespaces')
             elif isinstance(stats, dict):
                 ns_data = stats.get('namespaces')
-                print(f"方式3 - dict get: {ns_data}")
         
-        print(f"ns_data type: {type(ns_data)}")
-        print(f"ns_data: {ns_data}")
-        
-        if ns_data:
-            # 如果是字典类型
-            if isinstance(ns_data, dict):
-                for ns in ns_data.keys():
-                    if ns and str(ns).strip():
-                        namespaces.append(str(ns))
-            # 如果是其他可迭代类型
-            elif hasattr(ns_data, '__iter__') and not isinstance(ns_data, str):
-                for ns in ns_data:
-                    if ns and str(ns).strip():
-                        namespaces.append(str(ns))
+        if ns_data and isinstance(ns_data, dict):
+            for ns in ns_data.keys():
+                if ns and str(ns).strip():
+                    namespaces.append(str(ns))
         
         # 添加default选项
         if "default" not in namespaces:
             namespaces.insert(0, "default")
         
         result = sorted(list(set(namespaces)))
-        print(f"最终返回命名空间列表: {result}")
+        elapsed = time.time() - start_time
+        print(f"获取命名空间列表成功，耗时: {elapsed:.2f}秒，命名空间: {result}")
         return result
     except Exception as e:
         print(f"获取命名空间列表失败: {str(e)}")
@@ -521,18 +595,62 @@ def get_namespace_list(index_name: str):
 
 def refresh_namespaces(index_name: str):
     """刷新命名空间列表"""
+    if not index_name or index_name == "请先创建索引":
+        return gr.update(choices=["default"], value="default")
+    
     namespaces = get_namespace_list(index_name)
     return gr.update(choices=namespaces, value=namespaces[0] if namespaces else "default")
 
 
-def upload_files(files, index_name, namespace, max_chars, overlap, ollama_url, ocr_model, 
+def scan_folder(folder_path: str):
+    """递归扫描文件夹，返回所有支持的文件路径列表"""
+    supported_extensions = {'.txt', '.md', '.doc', '.docx', '.xlsx', '.pdf', '.jpg', '.jpeg', '.png', '.bmp'}
+    files = []
+    
+    if not folder_path or not os.path.exists(folder_path):
+        return []
+    
+    try:
+        for root, dirs, filenames in os.walk(folder_path):
+            for filename in filenames:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in supported_extensions:
+                    full_path = os.path.join(root, filename)
+                    files.append(full_path)
+        
+        # 按路径排序，保持一定顺序
+        files.sort()
+        return files
+    except Exception as e:
+        print(f"扫描文件夹失败: {e}")
+        return []
+
+
+def upload_files(files, folder_path, index_name, namespace, max_chars, overlap, ollama_url, ocr_model, 
                  embedding_api_key, embedding_base_url, embedding_model, embedding_dimension):
-    """上传文件到Pinecone"""
-    if not files:
-        return "请至少选择一个文件"
+    """上传文件到Pinecone，支持文件选择和文件夹选择（生成器模式，实时显示进度）"""
+    
+    # 优先使用文件夹路径（如果填写了）
+    if folder_path and folder_path.strip():
+        folder_path = folder_path.strip()
+        if not os.path.exists(folder_path):
+            yield f"❌ 文件夹不存在: {folder_path}"
+            return
+        
+        files = scan_folder(folder_path)
+        if not files:
+            yield f"❌ 文件夹中没有支持的文件类型\n支持的格式: .txt, .md, .doc, .docx, .xlsx, .pdf, .jpg, .jpeg, .png, .bmp"
+            return
+    elif files:
+        # 使用选择的文件
+        pass
+    else:
+        yield "❌ 请选择文件或输入文件夹路径"
+        return
     
     if not index_name:
-        return "请先选择一个索引"
+        yield "❌ 请先选择一个索引"
+        return
     
     # 使用自定义命名空间或选择的命名空间
     final_namespace = namespace.strip() if namespace and namespace.strip() else "default"
@@ -545,25 +663,78 @@ def upload_files(files, index_name, namespace, max_chars, overlap, ollama_url, o
     
     index, error = get_pinecone_index(index_name, dimension=dimension)
     if error:
-        return error
+        yield f"❌ {error}"
+        return
     
     results = []
     total_docs = 0
     total_vectors = 0
+    total_files = len(files)
     
-    for file_obj in files:
+    results.append(f"📁 共发现 {total_files} 个文件")
+    results.append(f"{'='*50}")
+    yield "\n".join(results)
+    
+    for file_idx, file_obj in enumerate(files, 1):
         try:
-            filename = os.path.basename(file_obj.name)
-            results.append(f"📄 处理文件: {filename}")
+            # 处理文件夹模式（file_obj是字符串路径）和文件模式（file_obj是文件对象）
+            if isinstance(file_obj, str):
+                # 文件夹模式：file_obj是文件路径字符串
+                filename = os.path.basename(file_obj)
+                results.append(f"\n📄 [{file_idx}/{total_files}] 正在处理: {filename}")
+                yield "\n".join(results)
+                
+                # 读取文件内容
+                with open(file_obj, 'rb') as f:
+                    file_content = f.read()
+            else:
+                # 文件模式：file_obj是Gradio文件对象
+                filename = os.path.basename(file_obj.name)
+                results.append(f"\n📄 [{file_idx}/{total_files}] 正在处理: {filename}")
+                yield "\n".join(results)
+                
+                # 读取文件内容
+                file_content = file_obj.read() if hasattr(file_obj, 'read') else b''
             
-            # 提取文本
-            content, error = extract_text_from_file(file_obj, ollama_url, ocr_model)
-            if error:
-                results.append(f"  ❌ {error}")
-                continue
+            # 判断文件类型
+            ext = os.path.splitext(filename)[1].lower()
             
-            if not content.strip():
+            # PDF文件：先转Markdown，再用Markdown内容上传
+            if ext == '.pdf':
+                results.append(f"  📝 PDF转Markdown中...")
+                yield "\n".join(results)
+                
+                content, error = pdf_to_markdown_with_ollama(file_content, ollama_url, ocr_model, filename)
+                
+                if error:
+                    results.append(f"  ❌ PDF转Markdown失败: {error}")
+                    yield "\n".join(results)
+                    continue
+                
+                results.append(f"  ✅ Markdown已保存到 docs 文件夹")
+                yield "\n".join(results)
+            else:
+                # 非PDF文件：使用原来的提取方式
+                # 创建临时文件对象
+                class TempFile:
+                    def __init__(self, name, content):
+                        self.name = name
+                        self._content = content
+                    
+                    def read(self):
+                        return self._content
+                
+                temp_file = TempFile(filename, file_content)
+                content, error = extract_text_from_file(temp_file, ollama_url, ocr_model)
+                
+                if error:
+                    results.append(f"  ❌ {error}")
+                    yield "\n".join(results)
+                    continue
+            
+            if not content or not content.strip():
                 results.append(f"  ⚠️ 文件内容为空，跳过")
+                yield "\n".join(results)
                 continue
             
             total_docs += 1
@@ -571,10 +742,14 @@ def upload_files(files, index_name, namespace, max_chars, overlap, ollama_url, o
             # 分割文本
             chunks = split_text(content, max_chars=max_chars, overlap=overlap)
             results.append(f"  ✓ 分割成 {len(chunks)} 个文本块")
+            yield "\n".join(results)
             
             # 生成向量并上传
             vectors_to_upsert = []
             for batch_id, batch_chunks in enumerate(batched(chunks, batch_size=32), start=1):
+                results.append(f"  🔄 生成向量批次 {batch_id}...")
+                yield "\n".join(results)
+                
                 embeddings, error = embed_texts(
                     batch_chunks, 
                     model=model, 
@@ -583,6 +758,7 @@ def upload_files(files, index_name, namespace, max_chars, overlap, ollama_url, o
                 )
                 if error:
                     results.append(f"  ❌ 嵌入失败: {error}")
+                    yield "\n".join(results)
                     continue
                 
                 for i, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings), start=1):
@@ -600,18 +776,21 @@ def upload_files(files, index_name, namespace, max_chars, overlap, ollama_url, o
             if vectors_to_upsert:
                 index.upsert(vectors=vectors_to_upsert, namespace=final_namespace)
                 total_vectors += len(vectors_to_upsert)
-                results.append(f"  ✓ 成功上传 {len(vectors_to_upsert)} 个向量到命名空间 '{final_namespace}'")
+                results.append(f"  ✅ 完成! 上传 {len(vectors_to_upsert)} 个向量")
+                yield "\n".join(results)
             
         except Exception as e:
             results.append(f"  ❌ 处理失败: {str(e)}")
+            yield "\n".join(results)
     
     results.append(f"\n{'='*50}")
     results.append(f"📊 上传完成!")
-    results.append(f"  - 处理文档: {total_docs}")
+    results.append(f"  - 总文件数: {total_files}")
+    results.append(f"  - 成功处理: {total_docs}")
     results.append(f"  - 创建向量: {total_vectors}")
     results.append(f"  - 命名空间: {final_namespace}")
     
-    return "\n".join(results)
+    yield "\n".join(results)
 
 
 def search_documents(query, index_name, namespace, top_k=5, 
@@ -712,12 +891,15 @@ def convert_pdf_to_markdown(pdf_file, ollama_url, ocr_model):
 # ============ 创建 Gradio 界面 ============
 
 def create_ui():
-    indexes, error = get_index_list()
+    # 尝试获取索引列表，失败时使用默认值
+    try:
+        indexes, error = get_index_list()
+    except Exception as e:
+        print(f"获取索引列表异常: {e}")
+        indexes, error = [], f"Pinecone连接失败: {str(e)}"
     
-    # 获取初始命名空间列表
+    # 启动时不获取命名空间，避免网络问题导致启动失败
     initial_namespaces = ["default"]
-    if indexes and indexes[0] and indexes[0] != "请先创建索引":
-        initial_namespaces = get_namespace_list(indexes[0])
     
     with gr.Blocks(title="PineDocs - 文档向量管理系统", css="""
         .container { max-width: 1200px; margin: 0 auto; }
@@ -810,10 +992,17 @@ def create_ui():
                 with gr.Tab("📤 上传文档"):
                     gr.Markdown("### 上传文件到向量数据库")
                     
+                    gr.Markdown("**方式一：选择文件（支持多选）**")
                     file_input = gr.File(
                         label="选择文件",
                         file_count="multiple",
                         file_types=[".txt", ".md", ".doc", ".docx", ".xlsx", ".pdf", ".jpg", ".jpeg", ".png", ".bmp"]
+                    )
+                    
+                    gr.Markdown("**方式二：输入文件夹路径（自动扫描子文件夹）**")
+                    folder_input = gr.Textbox(
+                        label="文件夹路径",
+                        placeholder="输入文件夹完整路径，如: D:\\Documents\\MyFiles，留空则不使用此方式"
                     )
                     
                     with gr.Row():
@@ -940,9 +1129,10 @@ def create_ui():
         
         upload_btn.click(
             fn=upload_files,
-            inputs=[file_input, index_dropdown, custom_namespace, max_chars, overlap, ollama_url, ocr_model,
+            inputs=[file_input, folder_input, index_dropdown, custom_namespace, max_chars, overlap, ollama_url, ocr_model,
                    embedding_api_key, embedding_base_url, embedding_model, embedding_dimension],
-            outputs=[upload_output]
+            outputs=[upload_output],
+            show_progress=True
         )
         
         search_btn.click(
