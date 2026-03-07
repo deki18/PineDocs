@@ -129,6 +129,264 @@ def split_text(text: str, max_chars: int = 1000, overlap: int = 200) -> List[str
     return chunks
 
 
+def split_markdown_by_headers(markdown_text: str) -> List[Tuple[str, str]]:
+    """
+    按Markdown标题层级切分文本
+    返回: [(header, content), ...]
+    """
+    import re
+    
+    # 匹配 # 到 ###### 各级标题 (1-6级标题)
+    header_pattern = r'^(#{1,6})\s+(.+)$'
+    
+    sections = []
+    current_header = "文档开头"
+    current_content = []
+    
+    lines = markdown_text.split('\n')
+    
+    for line in lines:
+        match = re.match(header_pattern, line.strip())
+        if match:
+            # 保存上一个章节
+            if current_content:
+                content = '\n'.join(current_content).strip()
+                if content:
+                    sections.append((current_header, content))
+            # 开始新章节
+            current_header = match.group(2).strip()
+            current_content = []
+        else:
+            current_content.append(line)
+    
+    # 保存最后一个章节
+    if current_content:
+        content = '\n'.join(current_content).strip()
+        if content:
+            sections.append((current_header, content))
+    
+    # 如果没有找到任何标题，将整个文本作为一个章节
+    if not sections and markdown_text.strip():
+        sections.append(("全文", markdown_text.strip()))
+    
+    return sections
+
+
+def is_table_line(line: str) -> bool:
+    """检查是否是Markdown表格行"""
+    stripped = line.strip()
+    # 表格行特征: 以 | 开头和结尾，或者包含 | 分隔符
+    return stripped.startswith('|') and stripped.endswith('|') and '|' in stripped[1:-1]
+
+
+def is_table_separator(line: str) -> bool:
+    """检查是否是表格分隔符行 (如 |---|---|)"""
+    stripped = line.strip()
+    if not stripped.startswith('|') or not stripped.endswith('|'):
+        return False
+    # 去除首尾的 |，检查中间是否只包含 -、: 和 |
+    inner = stripped[1:-1]
+    return all(c in '-:| ' for c in inner)
+
+
+def extract_tables(text: str) -> List[Tuple[str, str]]:
+    """
+    从文本中提取表格
+    返回: [(table_header, table_content), ...]
+    """
+    lines = text.split('\n')
+    tables = []
+    current_table = []
+    table_header = ""
+    in_table = False
+    
+    for i, line in enumerate(lines):
+        if is_table_line(line) and not is_table_separator(line):
+            if not in_table:
+                # 表格开始，尝试获取表头
+                in_table = True
+                current_table = [line]
+                # 向上查找可能的表格标题（非空行）
+                for j in range(i-1, max(i-5, -1), -1):
+                    prev_line = lines[j].strip()
+                    if prev_line and not is_table_line(prev_line):
+                        table_header = prev_line
+                        break
+            else:
+                current_table.append(line)
+        elif in_table:
+            if line.strip() == '' or is_table_separator(line):
+                current_table.append(line)
+            else:
+                # 表格结束
+                if len(current_table) >= 2:  # 至少表头+一行数据
+                    table_content = '\n'.join(current_table).strip()
+                    if table_content:
+                        tables.append((table_header, table_content))
+                in_table = False
+                current_table = []
+                table_header = ""
+    
+    # 处理文档末尾的表格
+    if in_table and len(current_table) >= 2:
+        table_content = '\n'.join(current_table).strip()
+        if table_content:
+            tables.append((table_header, table_content))
+    
+    return tables
+
+
+def split_pdf_markdown(markdown_text: str, chunk_size: int = 512, chunk_overlap: int = 100) -> List[Tuple[str, str, str]]:
+    """
+    PDF专用三层级切分逻辑
+    
+    Level 1: 按 ## 二级标题切分
+    Level 2: 如果内容超过 chunk_size，按段落(\n\n)切分
+    Level 3: 如果段落还超长，按字符强制切分
+    
+    返回: [(header, content, content_type), ...]
+        content_type: 'text' 或 'table'
+    """
+    import re
+    
+    results = []
+    
+    # Level 1: 按标题粗切
+    sections = split_markdown_by_headers(markdown_text)
+    print(f"[PDF Split] Found {len(sections)} sections by headers")
+    
+    for header, section_content in sections:
+        # 先提取表格，单独处理
+        tables = extract_tables(section_content)
+        table_ranges = []
+        
+        # 标记表格位置，避免重复切分
+        for table_header_text, table_content in tables:
+            # 表格作为一个整体
+            if len(table_content) <= chunk_size * 2:  # 不太长的表格直接保留
+                results.append((f"{header} - {table_header_text}" if table_header_text else header, 
+                              table_content, 'table'))
+            else:
+                # 长表格按行切分，每行都带表头
+                table_lines = table_content.split('\n')
+                if len(table_lines) >= 2:
+                    # 第一行是表头
+                    header_line = table_lines[0]
+                    separator = table_lines[1] if is_table_separator(table_lines[1]) else ""
+                    data_rows = table_lines[2:] if separator else table_lines[1:]
+                    
+                    # 每 chunk_size/2 字符左右切分一次
+                    current_chunk = [header_line]
+                    if separator:
+                        current_chunk.append(separator)
+                    current_size = len(header_line) + len(separator)
+                    
+                    for row in data_rows:
+                        if current_size + len(row) > chunk_size and current_chunk:
+                            # 保存当前块
+                            results.append((f"{header} - {table_header_text} (表格片段)" if table_header_text else f"{header} (表格片段)",
+                                          '\n'.join(current_chunk), 'table'))
+                            # 新开一块，带上表头
+                            current_chunk = [header_line]
+                            if separator:
+                                current_chunk.append(separator)
+                            current_size = len(header_line) + len(separator)
+                        
+                        current_chunk.append(row)
+                        current_size += len(row) + 1
+                    
+                    # 保存最后一块
+                    if len(current_chunk) > (2 if separator else 1):
+                        results.append((f"{header} - {table_header_text} (表格片段)" if table_header_text else f"{header} (表格片段)",
+                                      '\n'.join(current_chunk), 'table'))
+        
+        # 移除表格内容，处理剩余文本
+        text_without_tables = section_content
+        for _, table_content in tables:
+            text_without_tables = text_without_tables.replace(table_content, '')
+        text_without_tables = re.sub(r'\n{3,}', '\n\n', text_without_tables).strip()
+        
+        if not text_without_tables:
+            continue
+        
+        # Level 2 & 3: 对非表格内容进行细切
+        if len(text_without_tables) <= chunk_size:
+            # 内容较短，直接保留
+            results.append((header, text_without_tables, 'text'))
+        else:
+            # 按段落切分
+            paragraphs = text_without_tables.split('\n\n')
+            current_chunk = []
+            current_size = 0
+            chunk_index = 1
+            
+            for para in paragraphs:
+                para = para.strip()
+                if not para:
+                    continue
+                
+                para_size = len(para)
+                
+                # 如果单个段落就超过 chunk_size，需要强制切分
+                if para_size > chunk_size:
+                    # 先保存当前累积的内容
+                    if current_chunk:
+                        content = '\n\n'.join(current_chunk)
+                        results.append((f"{header} (片段{chunk_index})", content, 'text'))
+                        chunk_index += 1
+                        current_chunk = []
+                        current_size = 0
+                    
+                    # 强制切分这个长段落
+                    start = 0
+                    while start < para_size:
+                        end = min(start + chunk_size, para_size)
+                        # 尝试在句子边界切分
+                        if end < para_size:
+                            for sep in ['。', '！', '？', '；', '\n']:
+                                pos = para.rfind(sep, start, end)
+                                if pos > start + chunk_size // 2:
+                                    end = pos + 1
+                                    break
+                        
+                        sub_para = para[start:end].strip()
+                        if sub_para:
+                            results.append((f"{header} (片段{chunk_index})", sub_para, 'text'))
+                            chunk_index += 1
+                        
+                        start = end - chunk_overlap if end < para_size else end
+                else:
+                    # 检查加入当前块是否会超限
+                    if current_size + para_size + 2 > chunk_size and current_chunk:
+                        # 保存当前块
+                        content = '\n\n'.join(current_chunk)
+                        results.append((f"{header} (片段{chunk_index})", content, 'text'))
+                        chunk_index += 1
+                        
+                        # 新块，带上重叠内容（上一段的最后一部分）
+                        if current_chunk and chunk_overlap > 0:
+                            overlap_text = current_chunk[-1][-chunk_overlap:] if len(current_chunk[-1]) > chunk_overlap else current_chunk[-1]
+                            current_chunk = [overlap_text, para]
+                            current_size = len(overlap_text) + para_size + 2
+                        else:
+                            current_chunk = [para]
+                            current_size = para_size
+                    else:
+                        current_chunk.append(para)
+                        current_size += para_size + 2
+            
+            # 保存最后一个块
+            if current_chunk:
+                content = '\n\n'.join(current_chunk)
+                if chunk_index == 1:
+                    results.append((header, content, 'text'))
+                else:
+                    results.append((f"{header} (片段{chunk_index})", content, 'text'))
+    
+    print(f"[PDF Split] Generated {len(results)} chunks")
+    return results
+
+
 def extract_text_from_file(file_obj, ollama_url: str = "http://localhost:11434", ocr_model: str = "my-glm-ocr:latest") -> Tuple[str, str]:
     """从文件中提取文本"""
     try:
@@ -315,9 +573,90 @@ def extract_word_text(file_bytes: bytes, ext: str) -> Tuple[str, str]:
         if ext == '.docx':
             # 处理 .docx 文件 (ZIP格式的XML)
             from docx import Document
+            
+            # 检查文件大小
+            file_size = len(file_bytes)
+            print(f"[DEBUG] DOCX file size: {file_size} bytes")
+            
+            if file_size == 0:
+                return "", "文件大小为0，可能是空文件"
+            
             doc = Document(io.BytesIO(file_bytes))
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            return "\n".join(paragraphs), None
+            
+            all_text = []
+            
+            # 提取段落文本
+            para_count = len(doc.paragraphs)
+            print(f"[DEBUG] Number of paragraphs: {para_count}")
+            
+            for i, para in enumerate(doc.paragraphs):
+                para_text = para.text.strip()
+                if para_text:
+                    all_text.append(para.text)
+                    if i < 5:  # 只打印前5个段落用于调试
+                        print(f"[DEBUG] Paragraph {i}: {para_text[:100]}...")
+            
+            # 提取表格中的文本
+            table_count = len(doc.tables)
+            print(f"[DEBUG] Number of tables: {table_count}")
+            
+            for table_idx, table in enumerate(doc.tables):
+                for row in table.rows:
+                    row_texts = []
+                    for cell in row.cells:
+                        cell_text = cell.text.strip()
+                        if cell_text:
+                            row_texts.append(cell_text)
+                    if row_texts:
+                        all_text.append(" | ".join(row_texts))
+            
+            # 提取页眉中的文本
+            section_count = len(doc.sections)
+            print(f"[DEBUG] Number of sections: {section_count}")
+            
+            for section in doc.sections:
+                try:
+                    header = section.header
+                    for para in header.paragraphs:
+                        if para.text.strip():
+                            all_text.append(para.text)
+                except Exception as e:
+                    print(f"[DEBUG] Header extraction error: {e}")
+                
+                # 提取页脚中的文本
+                try:
+                    footer = section.footer
+                    for para in footer.paragraphs:
+                        if para.text.strip():
+                            all_text.append(para.text)
+                except Exception as e:
+                    print(f"[DEBUG] Footer extraction error: {e}")
+            
+            # 尝试从文档的XML中直接提取所有文本（备用方案）
+            if not all_text:
+                print("[DEBUG] Trying alternative text extraction from XML...")
+                try:
+                    from docx.oxml import parse_xml
+                    from docx.oxml.ns import qn
+                    
+                    # 获取文档的XML元素
+                    xml_content = doc.element.xml
+                    # 简单的文本提取：找到所有<w:t>标签的内容
+                    import re
+                    text_matches = re.findall(r'<w:t[^>]*>([^<]+)</w:t>', xml_content)
+                    alt_text = [t.strip() for t in text_matches if t.strip()]
+                    if alt_text:
+                        all_text.extend(alt_text)
+                        print(f"[DEBUG] Alternative extraction found {len(alt_text)} text segments")
+                except Exception as e:
+                    print(f"[DEBUG] Alternative extraction failed: {e}")
+            
+            result = "\n".join(all_text)
+            print(f"[DEBUG] Total extracted text length: {len(result)} characters")
+            
+            if not result.strip():
+                return "", "文档内容为空（python-docx无法提取内容，可能是特殊格式的文档）"
+            return result, None
         elif ext == '.doc':
             # 处理 .doc 文件 (旧版Word二进制格式)
             # 在Windows上使用Word COM接口
@@ -349,8 +688,38 @@ def extract_word_text(file_bytes: bytes, ext: str) -> Tuple[str, str]:
                     # 读取转换后的.docx文件
                     from docx import Document
                     doc = Document(temp_docx_path)
-                    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                    return "\n".join(paragraphs), None
+                    
+                    all_text = []
+                    
+                    # 提取段落文本
+                    for para in doc.paragraphs:
+                        if para.text.strip():
+                            all_text.append(para.text)
+                    
+                    # 提取表格中的文本
+                    for table in doc.tables:
+                        for row in table.rows:
+                            row_texts = []
+                            for cell in row.cells:
+                                cell_text = cell.text.strip()
+                                if cell_text:
+                                    row_texts.append(cell_text)
+                            if row_texts:
+                                all_text.append(" | ".join(row_texts))
+                    
+                    # 提取页眉页脚
+                    for section in doc.sections:
+                        for para in section.header.paragraphs:
+                            if para.text.strip():
+                                all_text.append(para.text)
+                        for para in section.footer.paragraphs:
+                            if para.text.strip():
+                                all_text.append(para.text)
+                    
+                    result = "\n".join(all_text)
+                    if not result.strip():
+                        return "", "文档内容为空"
+                    return result, None
                     
                 finally:
                     # 清理临时文件
@@ -393,7 +762,7 @@ def extract_excel_text(file_bytes: bytes) -> Tuple[str, str]:
         return "", f"Excel处理失败: {str(e)}"
 
 
-def batched(items, batch_size=32):
+def batched(items, batch_size=10):
     """将列表分批"""
     for i in range(0, len(items), batch_size):
         yield items[i:i + batch_size]
@@ -485,7 +854,12 @@ def pdf_to_markdown_with_ollama(pdf_bytes: bytes, ollama_url: str = "http://loca
                     f"{ollama_url}/api/generate",
                     json={
                         "model": "my-glm-ocr:latest",
-                        "prompt": "Text Recognition:",
+                        "prompt": """请分析图片内容并转换为 Markdown 格式。
+要求：
+1. 遇到表格，必须使用 Markdown 表格语法（| 列1 | 列2 |）
+2. 遇到标题，使用 #, ##, ### 等标识层级
+3. 保留原文的段落结构和列表格式
+4. 不要包含"这是一张图片"等无关解释，直接输出 Markdown 内容""",
                         "images": [img_base64],
                         "stream": False
                     },
@@ -699,12 +1073,12 @@ def upload_files(files, folder_path, index_name, namespace, max_chars, overlap, 
             # 判断文件类型
             ext = os.path.splitext(filename)[1].lower()
             
-            # PDF文件：先转Markdown，再用Markdown内容上传
+            # PDF文件：先转Markdown，再用Markdown内容上传（使用三层级切分）
             if ext == '.pdf':
                 results.append(f"  📝 PDF转Markdown中...")
                 yield "\n".join(results)
                 
-                content, error = pdf_to_markdown_with_ollama(file_content, ollama_url, ocr_model, filename)
+                markdown_content, error = pdf_to_markdown_with_ollama(file_content, ollama_url, ocr_model, filename)
                 
                 if error:
                     results.append(f"  ❌ PDF转Markdown失败: {error}")
@@ -713,6 +1087,68 @@ def upload_files(files, folder_path, index_name, namespace, max_chars, overlap, 
                 
                 results.append(f"  ✅ Markdown已保存到 docs 文件夹")
                 yield "\n".join(results)
+                
+                # 使用PDF专用三层级切分
+                if int(max_chars) != 512:
+                    results.append(f"  ⚡ 检测到PDF，已自动启用智能优化参数: 忽略全局设置，强制使用 chunk_size=512, overlap=100 以获得最佳检索效果")
+                else:
+                    results.append(f"  ⚡ 检测到PDF，已自动启用智能优化参数: chunk_size=512, overlap=100")
+                yield "\n".join(results)
+                
+                pdf_chunks = split_pdf_markdown(markdown_content, chunk_size=512, chunk_overlap=100)
+                
+                if not pdf_chunks:
+                    results.append(f"  ⚠️ PDF内容切分后为空，跳过")
+                    yield "\n".join(results)
+                    continue
+                
+                total_docs += 1
+                
+                # 统计信息
+                text_chunks = [c for c in pdf_chunks if c[2] == 'text']
+                table_chunks = [c for c in pdf_chunks if c[2] == 'table']
+                results.append(f"  ✓ 切分完成: {len(pdf_chunks)} 个块 (文本:{len(text_chunks)}, 表格:{len(table_chunks)})")
+                yield "\n".join(results)
+                
+                # 生成向量并上传
+                vectors_to_upsert = []
+                for batch_id, batch_chunks in enumerate(batched(pdf_chunks, batch_size=10), start=1):
+                    results.append(f"  🔄 生成向量批次 {batch_id}...")
+                    yield "\n".join(results)
+                    
+                    # 提取纯文本内容用于生成向量
+                    batch_texts = [chunk[1] for chunk in batch_chunks]
+                    
+                    embeddings, error = embed_texts(
+                        batch_texts, 
+                        model=model, 
+                        api_key=api_key, 
+                        base_url=base_url
+                    )
+                    if error:
+                        results.append(f"  ❌ 嵌入失败: {error}")
+                        yield "\n".join(results)
+                        continue
+                    
+                    for i, ((header, content, content_type), embedding) in enumerate(zip(batch_chunks, embeddings), start=1):
+                        vec_id = generate_safe_id(filename, batch_id, i)
+                        vectors_to_upsert.append({
+                            "id": vec_id,
+                            "values": embedding,
+                            "metadata": {
+                                "source": filename,
+                                "chunk_index": i,
+                                "text": content,
+                                "header": header,
+                                "content_type": content_type,
+                            },
+                        })
+                
+                if vectors_to_upsert:
+                    index.upsert(vectors=vectors_to_upsert, namespace=final_namespace)
+                    total_vectors += len(vectors_to_upsert)
+                    results.append(f"  ✅ 完成! 上传 {len(vectors_to_upsert)} 个向量")
+                    yield "\n".join(results)
             else:
                 # 非PDF文件：使用原来的提取方式
                 # 创建临时文件对象
@@ -731,53 +1167,53 @@ def upload_files(files, folder_path, index_name, namespace, max_chars, overlap, 
                     results.append(f"  ❌ {error}")
                     yield "\n".join(results)
                     continue
-            
-            if not content or not content.strip():
-                results.append(f"  ⚠️ 文件内容为空，跳过")
-                yield "\n".join(results)
-                continue
-            
-            total_docs += 1
-            
-            # 分割文本
-            chunks = split_text(content, max_chars=max_chars, overlap=overlap)
-            results.append(f"  ✓ 分割成 {len(chunks)} 个文本块")
-            yield "\n".join(results)
-            
-            # 生成向量并上传
-            vectors_to_upsert = []
-            for batch_id, batch_chunks in enumerate(batched(chunks, batch_size=32), start=1):
-                results.append(f"  🔄 生成向量批次 {batch_id}...")
-                yield "\n".join(results)
                 
-                embeddings, error = embed_texts(
-                    batch_chunks, 
-                    model=model, 
-                    api_key=api_key, 
-                    base_url=base_url
-                )
-                if error:
-                    results.append(f"  ❌ 嵌入失败: {error}")
+                if not content or not content.strip():
+                    results.append(f"  ⚠️ 文件内容为空，跳过")
                     yield "\n".join(results)
                     continue
                 
-                for i, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings), start=1):
-                    vec_id = generate_safe_id(filename, batch_id, i)
-                    vectors_to_upsert.append({
-                        "id": vec_id,
-                        "values": embedding,
-                        "metadata": {
-                            "source": filename,
-                            "chunk_index": i,
-                            "text": chunk_text,
-                        },
-                    })
-            
-            if vectors_to_upsert:
-                index.upsert(vectors=vectors_to_upsert, namespace=final_namespace)
-                total_vectors += len(vectors_to_upsert)
-                results.append(f"  ✅ 完成! 上传 {len(vectors_to_upsert)} 个向量")
+                total_docs += 1
+                
+                # 分割文本
+                chunks = split_text(content, max_chars=max_chars, overlap=overlap)
+                results.append(f"  ✓ 分割成 {len(chunks)} 个文本块")
                 yield "\n".join(results)
+                
+                # 生成向量并上传
+                vectors_to_upsert = []
+                for batch_id, batch_chunks in enumerate(batched(chunks, batch_size=10), start=1):
+                    results.append(f"  🔄 生成向量批次 {batch_id}...")
+                    yield "\n".join(results)
+                    
+                    embeddings, error = embed_texts(
+                        batch_chunks, 
+                        model=model, 
+                        api_key=api_key, 
+                        base_url=base_url
+                    )
+                    if error:
+                        results.append(f"  ❌ 嵌入失败: {error}")
+                        yield "\n".join(results)
+                        continue
+                    
+                    for i, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings), start=1):
+                        vec_id = generate_safe_id(filename, batch_id, i)
+                        vectors_to_upsert.append({
+                            "id": vec_id,
+                            "values": embedding,
+                            "metadata": {
+                                "source": filename,
+                                "chunk_index": i,
+                                "text": chunk_text,
+                            },
+                        })
+                
+                if vectors_to_upsert:
+                    index.upsert(vectors=vectors_to_upsert, namespace=final_namespace)
+                    total_vectors += len(vectors_to_upsert)
+                    results.append(f"  ✅ 完成! 上传 {len(vectors_to_upsert)} 个向量")
+                    yield "\n".join(results)
             
         except Exception as e:
             results.append(f"  ❌ 处理失败: {str(e)}")
@@ -845,23 +1281,112 @@ def search_documents(query, index_name, namespace, top_k=5,
         return f"搜索失败: {str(e)}"
 
 
-def clear_namespace(index_name, namespace):
-    """清空命名空间"""
+def scan_zombie_vectors(index_name, namespace, sample_size):
+    """扫描命名空间中存在的文件来源"""
     if not index_name:
         return "请先选择一个索引"
-    
-    if not namespace or namespace == "default":
-        return "不能清空默认命名空间"
     
     index, error = get_pinecone_index(index_name)
     if error:
         return error
     
     try:
-        index.delete(delete_all=True, namespace=namespace)
-        return f"✅ 命名空间 '{namespace}' 已清空"
+        stats = index.describe_index_stats()
+        total_vectors = stats['namespaces'].get(namespace, {}).get('vector_count', 0)
+        
+        if total_vectors == 0:
+            return f"📊 命名空间 '{namespace}' 是空的，没有任何向量。"
+        
+        dimension = EMBEDDING_DIMENSION
+        dummy_vector = [0.0] * dimension
+        
+        query_result = index.query(
+            vector=dummy_vector,
+            top_k=min(sample_size, 10000),
+            namespace=namespace,
+            include_metadata=True
+        )
+        
+        found_sources = {}
+        for match in query_result.matches:
+            if match.metadata and "source" in match.metadata:
+                source = match.metadata["source"]
+                found_sources[source] = found_sources.get(source, 0) + 1
+        
+        if not found_sources:
+            return f"📊 总向量数: {total_vectors}\n⚠️ 未发现包含 source 字段的向量"
+        
+        result_text = f"📊 命名空间 '{namespace}' 统计:\n"
+        result_text += f"总向量数: {total_vectors}\n"
+        result_text += f"采样数: {len(query_result.matches)}\n"
+        result_text += f"发现文件数: {len(found_sources)}\n\n"
+        result_text += "=" * 50 + "\n"
+        result_text += "📁 已上传的文件列表:\n"
+        result_text += "=" * 50 + "\n"
+        
+        sorted_sources = sorted(found_sources.items(), key=lambda x: x[1], reverse=True)
+        for source, count in sorted_sources:
+            result_text += f"  📄 {source} ({count} 个向量)\n"
+        
+        result_text += "\n" + "=" * 50 + "\n"
+        result_text += "💡 提示：如需删除某些文件，请手动将文件名复制到下方输入框\n"
+        result_text += "   （每行一个文件名，仅删除上传失败的文件）\n"
+        
+        return result_text
+        
     except Exception as e:
-        return f"清空失败: {str(e)}"
+        return f"扫描失败: {str(e)}"
+
+
+def delete_file_vectors(index_name, namespace, files_to_delete):
+    """删除指定文件的向量"""
+    if not index_name:
+        return "请先选择一个索引"
+    
+    if not files_to_delete:
+        return "请选择要删除的文件"
+    
+    index, error = get_pinecone_index(index_name)
+    if error:
+        return error
+    
+    if isinstance(files_to_delete, str):
+        files_str = files_to_delete.strip()
+        if files_str.startswith('[') and files_str.endswith(']'):
+            import ast
+            try:
+                files = ast.literal_eval(files_str)
+                if isinstance(files, list):
+                    files = [f.strip() for f in files if f.strip()]
+                else:
+                    files = []
+            except:
+                files = [f.strip() for f in files_str.split('\n') if f.strip()]
+        else:
+            files = [f.strip() for f in files_str.split('\n') if f.strip()]
+    else:
+        files = list(files_to_delete)
+    
+    if not files:
+        return "没有有效的文件名"
+    
+    results = []
+    success_count = 0
+    
+    for filename in files:
+        try:
+            index.delete(
+                filter={"source": {"$eq": filename}},
+                namespace=namespace
+            )
+            results.append(f"✅ 已删除: {filename}")
+            success_count += 1
+        except Exception as e:
+            results.append(f"❌ 删除失败 {filename}: {str(e)}")
+    
+    summary = f"\n{'='*50}\n📊 清理完成: 成功删除 {success_count}/{len(files)} 个文件的向量\n"
+    
+    return "\n".join(results) + summary
 
 
 def convert_pdf_to_markdown(pdf_file, ollama_url, ocr_model):
@@ -1009,7 +1534,7 @@ def create_ui():
                         max_chars = gr.Slider(
                             minimum=100,
                             maximum=5000,
-                            value=1000,
+                            value=900,
                             step=100,
                             label="每块最大字符数"
                         )
@@ -1055,22 +1580,49 @@ def create_ui():
                     )
                 
                 with gr.Tab("🗑️ 管理"):
-                    gr.Markdown("### 命名空间管理")
+                    gr.Markdown("### 🧹 残留数据清理")
                     gr.Markdown("""
-                    **说明:** 下拉框只显示包含向量的命名空间。如果看不到某个命名空间，可能是因为：
-                    1. 该命名空间中没有上传过文档
-                    2. 该命名空间中的向量已被删除
+                    **功能说明:**
+                    - **扫描**: 查看当前命名空间中已上传的文件列表
+                    - **清理**: 删除指定文件的向量（用于处理上传中断的残留数据）
+                    
+                    ⚠️ **注意**: 如果上传中断，前面的批次已经存入数据库，需要手动清理后再重传！
                     """)
                     
-                    clear_namespace_dropdown = gr.Dropdown(
-                        choices=initial_namespaces,
-                        value=initial_namespaces[0] if initial_namespaces else "default",
-                        label="要清空的命名空间",
+                    with gr.Row():
+                        scan_namespace_dropdown = gr.Dropdown(
+                            choices=initial_namespaces,
+                            value=initial_namespaces[0] if initial_namespaces else "default",
+                            label="命名空间",
+                            interactive=True,
+                            allow_custom_value=True
+                        )
+                        scan_sample_size = gr.Slider(
+                            minimum=100,
+                            maximum=10000,
+                            value=2000,
+                            step=100,
+                            label="采样数量",
+                            info="采样越多越准确，但速度越慢"
+                        )
+                    
+                    scan_btn = gr.Button("🔍 扫描文件列表", variant="primary")
+                    scan_output = gr.Textbox(
+                        label="扫描结果",
+                        lines=15,
+                        max_lines=30,
+                        interactive=False
+                    )
+                    
+                    files_to_delete = gr.Textbox(
+                        label="要删除的文件（每行一个文件名）",
+                        placeholder="从扫描结果中复制需要删除的文件名，每行一个\n例如:\n文件1.pdf\n文件2.docx",
+                        lines=5,
                         interactive=True
                     )
                     
-                    clear_btn = gr.Button("🗑️ 清空命名空间", variant="stop")
-                    clear_output = gr.Textbox(label="操作结果", interactive=False)
+                    delete_btn = gr.Button("🗑️ 删除选中文件", variant="stop")
+                    delete_output = gr.Textbox(label="删除结果", interactive=False)
                 
                 with gr.Tab("📄 PDF转Markdown"):
                     gr.Markdown("### PDF转Markdown（使用OCR）")
@@ -1112,7 +1664,7 @@ def create_ui():
         refresh_btn.click(
             fn=refresh_namespaces,
             inputs=[index_dropdown],
-            outputs=[clear_namespace_dropdown]
+            outputs=[scan_namespace_dropdown]
         )
         
         index_dropdown.change(
@@ -1124,7 +1676,7 @@ def create_ui():
         index_dropdown.change(
             fn=refresh_namespaces,
             inputs=[index_dropdown],
-            outputs=[clear_namespace_dropdown]
+            outputs=[scan_namespace_dropdown]
         )
         
         upload_btn.click(
@@ -1142,10 +1694,28 @@ def create_ui():
             outputs=[search_output]
         )
         
-        clear_btn.click(
-            fn=clear_namespace,
-            inputs=[index_dropdown, clear_namespace_dropdown],
-            outputs=[clear_output]
+        refresh_btn.click(
+            fn=refresh_namespaces,
+            inputs=[index_dropdown],
+            outputs=[scan_namespace_dropdown]
+        )
+        
+        index_dropdown.change(
+            fn=refresh_namespaces,
+            inputs=[index_dropdown],
+            outputs=[scan_namespace_dropdown]
+        )
+        
+        scan_btn.click(
+            fn=scan_zombie_vectors,
+            inputs=[index_dropdown, scan_namespace_dropdown, scan_sample_size],
+            outputs=[scan_output]
+        )
+        
+        delete_btn.click(
+            fn=delete_file_vectors,
+            inputs=[index_dropdown, scan_namespace_dropdown, files_to_delete],
+            outputs=[delete_output]
         )
         
         convert_btn.click(
