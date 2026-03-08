@@ -762,8 +762,53 @@ def extract_excel_text(file_bytes: bytes) -> Tuple[str, str]:
         return "", f"Excel处理失败: {str(e)}"
 
 
+import sys
+
+MAX_REQUEST_SIZE = 2 * 1024 * 1024
+
+def estimate_vectors_size(vectors):
+    size = 0
+    for vec in vectors:
+        size += sys.getsizeof(vec.get("id", ""))
+        size += sys.getsizeof(vec.get("values", [])) * 8
+        metadata = vec.get("metadata", {})
+        for k, v in metadata.items():
+            size += sys.getsizeof(k)
+            size += sys.getsizeof(v)
+    return int(size * 1.2)
+
+def smart_upsert(index, vectors, namespace, results=None, depth=0):
+    if not vectors:
+        return 0
+    
+    estimated_size = estimate_vectors_size(vectors)
+    
+    if estimated_size <= MAX_REQUEST_SIZE or len(vectors) == 1:
+        try:
+            index.upsert(vectors=vectors, namespace=namespace)
+            if results is not None and depth > 0:
+                results.append(f"    ↳ 子批次上传 {len(vectors)} 个向量 ({estimated_size / 1024 / 1024:.2f}MB)")
+            return len(vectors)
+        except Exception as e:
+            if "exceeds the maximum" in str(e) and len(vectors) > 1:
+                pass
+            else:
+                raise e
+    
+    mid = len(vectors) // 2
+    first_half = vectors[:mid]
+    second_half = vectors[mid:]
+    
+    if results is not None:
+        results.append(f"    ⚠️ 批次过大 ({estimated_size / 1024 / 1024:.2f}MB > 2MB)，自动分割为 {len(first_half)} + {len(second_half)} 个向量")
+    
+    count = 0
+    count += smart_upsert(index, first_half, namespace, results, depth + 1)
+    count += smart_upsert(index, second_half, namespace, results, depth + 1)
+    
+    return count
+
 def batched(items, batch_size=10):
-    """将列表分批"""
     for i in range(0, len(items), batch_size):
         yield items[i:i + batch_size]
 
@@ -1145,9 +1190,9 @@ def upload_files(files, folder_path, index_name, namespace, max_chars, overlap, 
                         })
                 
                 if vectors_to_upsert:
-                    index.upsert(vectors=vectors_to_upsert, namespace=final_namespace)
-                    total_vectors += len(vectors_to_upsert)
-                    results.append(f"  ✅ 完成! 上传 {len(vectors_to_upsert)} 个向量")
+                    uploaded = smart_upsert(index, vectors_to_upsert, final_namespace, results)
+                    total_vectors += uploaded
+                    results.append(f"  ✅ 完成! 上传 {uploaded} 个向量")
                     yield "\n".join(results)
             else:
                 # 非PDF文件：使用原来的提取方式
@@ -1210,11 +1255,11 @@ def upload_files(files, folder_path, index_name, namespace, max_chars, overlap, 
                         })
                 
                 if vectors_to_upsert:
-                    index.upsert(vectors=vectors_to_upsert, namespace=final_namespace)
-                    total_vectors += len(vectors_to_upsert)
-                    results.append(f"  ✅ 完成! 上传 {len(vectors_to_upsert)} 个向量")
+                    uploaded = smart_upsert(index, vectors_to_upsert, final_namespace, results)
+                    total_vectors += uploaded
+                    results.append(f"  ✅ 完成! 上传 {uploaded} 个向量")
                     yield "\n".join(results)
-            
+        
         except Exception as e:
             results.append(f"  ❌ 处理失败: {str(e)}")
             yield "\n".join(results)
@@ -1281,8 +1326,8 @@ def search_documents(query, index_name, namespace, top_k=5,
         return f"搜索失败: {str(e)}"
 
 
-def scan_zombie_vectors(index_name, namespace, sample_size):
-    """扫描命名空间中存在的文件来源"""
+def scan_zombie_vectors(index_name, namespace, sample_size, filter_text=""):
+    """扫描命名空间中存在的文件来源，支持按文件名关键词筛选"""
     if not index_name:
         return "请先选择一个索引"
     
@@ -1316,17 +1361,42 @@ def scan_zombie_vectors(index_name, namespace, sample_size):
         if not found_sources:
             return f"📊 总向量数: {total_vectors}\n⚠️ 未发现包含 source 字段的向量"
         
+        # 处理筛选关键词（按行分割）
+        active_filters = []
+        if filter_text and filter_text.strip():
+            active_filters = [line.strip() for line in filter_text.strip().split('\n') if line.strip()]
+        
+        # 如果有筛选条件，过滤文件列表
+        filtered_sources = {}
+        if active_filters:
+            for source, count in found_sources.items():
+                # 只要匹配任意一个关键词就包含（不区分大小写）
+                if any(keyword.lower() in source.lower() for keyword in active_filters):
+                    filtered_sources[source] = count
+        else:
+            filtered_sources = found_sources
+        
         result_text = f"📊 命名空间 '{namespace}' 统计:\n"
         result_text += f"总向量数: {total_vectors}\n"
         result_text += f"采样数: {len(query_result.matches)}\n"
-        result_text += f"发现文件数: {len(found_sources)}\n\n"
-        result_text += "=" * 50 + "\n"
+        result_text += f"发现文件数: {len(found_sources)}\n"
+        
+        if active_filters:
+            result_text += f"\n🔍 筛选条件（{len(active_filters)}个）:\n"
+            for i, kw in enumerate(active_filters, 1):
+                result_text += f"  {i}. {kw}\n"
+            result_text += f"\n✅ 匹配文件数: {len(filtered_sources)}\n"
+        
+        result_text += "\n" + "=" * 50 + "\n"
         result_text += "📁 已上传的文件列表:\n"
         result_text += "=" * 50 + "\n"
         
-        sorted_sources = sorted(found_sources.items(), key=lambda x: x[1], reverse=True)
-        for source, count in sorted_sources:
-            result_text += f"  📄 {source} ({count} 个向量)\n"
+        if not filtered_sources:
+            result_text += "⚠️ 没有匹配筛选条件的文件\n"
+        else:
+            sorted_sources = sorted(filtered_sources.items(), key=lambda x: x[1], reverse=True)
+            for source, count in sorted_sources:
+                result_text += f"  📄 {source} ({count} 个向量)\n"
         
         result_text += "\n" + "=" * 50 + "\n"
         result_text += "💡 提示：如需删除某些文件，请手动将文件名复制到下方输入框\n"
@@ -1606,6 +1676,16 @@ def create_ui():
                             info="采样越多越准确，但速度越慢"
                         )
                     
+                    with gr.Accordion("📁 按文件名筛选（可选）", open=False):
+                        gr.Markdown("输入文件名关键词进行筛选，支持多条（每行一个关键词）")
+                        
+                        filename_filter_input = gr.Textbox(
+                            label="文件名包含（每行一个）",
+                            placeholder="输入文件名关键词，每行一个\n例如:\n丽水市\n绿色建筑\n规划",
+                            lines=4,
+                            interactive=True
+                        )
+                    
                     scan_btn = gr.Button("🔍 扫描文件列表", variant="primary")
                     scan_output = gr.Textbox(
                         label="扫描结果",
@@ -1708,7 +1788,7 @@ def create_ui():
         
         scan_btn.click(
             fn=scan_zombie_vectors,
-            inputs=[index_dropdown, scan_namespace_dropdown, scan_sample_size],
+            inputs=[index_dropdown, scan_namespace_dropdown, scan_sample_size, filename_filter_input],
             outputs=[scan_output]
         )
         
